@@ -1,0 +1,242 @@
+"""
+Nougat GUI - simple desktop app for OCR'ing scientific PDFs to Mathpix Markdown
+(and optionally HTML/PDF via pandoc). Runs Nougat on GPU when available.
+"""
+import os
+import re
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from tkinter import Tk, StringVar, BooleanVar, filedialog, messagebox, END, DISABLED, NORMAL
+from tkinter import ttk, scrolledtext
+
+# --- Configuration ----------------------------------------------------------
+NOUGAT_PYTHON = Path(r"C:\nougat-env\Scripts\python.exe")
+NOUGAT_EXE    = Path(r"C:\nougat-env\Scripts\nougat.exe")
+PANDOC_EXE    = Path(r"C:\Program Files\Pandoc\pandoc.exe")
+DEFAULT_MODEL = "0.1.0-base"
+
+
+def gpu_status() -> str:
+    """Return a short string describing CUDA / GPU availability."""
+    try:
+        out = subprocess.check_output(
+            [str(NOUGAT_PYTHON), "-c",
+             "import torch;print('CUDA' if torch.cuda.is_available() else 'CPU');"
+             "print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"],
+            stderr=subprocess.STDOUT, text=True, timeout=15,
+        ).strip().splitlines()
+        mode = out[0] if out else "?"
+        dev  = out[1] if len(out) > 1 else ""
+        return f"{mode}  {dev}".strip()
+    except Exception as e:
+        return f"unknown ({e})"
+
+
+class NougatApp:
+    def __init__(self, root: Tk):
+        self.root = root
+        root.title("Nougat PDF -> Markdown / HTML / PDF")
+        root.geometry("780x560")
+
+        self.input_pdf  = StringVar()
+        self.output_dir = StringVar(value=str(Path.home() / "Documents"))
+        self.out_name   = StringVar(value="output")
+        self.pages      = StringVar(value="")          # blank = all
+        self.make_html  = BooleanVar(value=True)
+        self.make_pdf   = BooleanVar(value=False)
+        self.gpu_text   = StringVar(value="checking GPU...")
+
+        self._build_ui()
+        threading.Thread(target=self._update_gpu, daemon=True).start()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 4}
+        frm = ttk.Frame(self.root)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Row: input PDF
+        ttk.Label(frm, text="Input PDF:").grid(row=0, column=0, sticky="e", **pad)
+        ttk.Entry(frm, textvariable=self.input_pdf, width=70).grid(row=0, column=1, sticky="we", **pad)
+        ttk.Button(frm, text="Browse...", command=self._pick_input).grid(row=0, column=2, **pad)
+
+        # Row: output dir
+        ttk.Label(frm, text="Output folder:").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Entry(frm, textvariable=self.output_dir, width=70).grid(row=1, column=1, sticky="we", **pad)
+        ttk.Button(frm, text="Browse...", command=self._pick_outdir).grid(row=1, column=2, **pad)
+
+        # Row: output base name
+        ttk.Label(frm, text="Output name:").grid(row=2, column=0, sticky="e", **pad)
+        ttk.Entry(frm, textvariable=self.out_name, width=40).grid(row=2, column=1, sticky="w", **pad)
+
+        # Row: page range
+        ttk.Label(frm, text="Pages (e.g. 1-5,10):").grid(row=3, column=0, sticky="e", **pad)
+        ttk.Entry(frm, textvariable=self.pages, width=20).grid(row=3, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="(blank = all)").grid(row=3, column=1, sticky="w", padx=(180, 0))
+
+        # Row: format checkboxes
+        opts = ttk.Frame(frm)
+        opts.grid(row=4, column=1, sticky="w", **pad)
+        ttk.Checkbutton(opts, text="Also produce HTML (MathJax)", variable=self.make_html).pack(side="left", padx=4)
+        ttk.Checkbutton(opts, text="Also produce PDF (needs LaTeX)", variable=self.make_pdf).pack(side="left", padx=4)
+
+        # Row: GPU status
+        gpu_frame = ttk.Frame(frm)
+        gpu_frame.grid(row=5, column=1, sticky="w", **pad)
+        ttk.Label(gpu_frame, text="Compute:").pack(side="left")
+        ttk.Label(gpu_frame, textvariable=self.gpu_text, foreground="#0a6").pack(side="left", padx=4)
+
+        # Row: run button
+        self.run_btn = ttk.Button(frm, text="Convert", command=self._run)
+        self.run_btn.grid(row=6, column=1, sticky="w", **pad)
+
+        # Log box
+        self.log = scrolledtext.ScrolledText(frm, height=18, wrap="word", font=("Consolas", 9))
+        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew", **pad)
+        frm.rowconfigure(7, weight=1)
+        frm.columnconfigure(1, weight=1)
+
+    # ---------- Helpers ----------
+    def _pick_input(self):
+        f = filedialog.askopenfilename(
+            title="Pick a PDF",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if f:
+            self.input_pdf.set(f)
+            stem = Path(f).stem
+            if not self.out_name.get() or self.out_name.get() == "output":
+                self.out_name.set(stem)
+
+    def _pick_outdir(self):
+        d = filedialog.askdirectory(title="Pick output folder")
+        if d:
+            self.output_dir.set(d)
+
+    def _update_gpu(self):
+        self.gpu_text.set(gpu_status())
+
+    def _log(self, text: str):
+        self.log.insert(END, text)
+        self.log.see(END)
+        self.log.update_idletasks()
+
+    # ---------- Run pipeline ----------
+    def _run(self):
+        in_pdf = Path(self.input_pdf.get().strip().strip('"'))
+        out_dir = Path(self.output_dir.get().strip().strip('"'))
+        name = (self.out_name.get().strip() or in_pdf.stem)
+        pages = self.pages.get().strip()
+
+        if not in_pdf.is_file():
+            messagebox.showerror("Missing file", f"Input PDF not found:\n{in_pdf}")
+            return
+        if not NOUGAT_EXE.is_file():
+            messagebox.showerror("Nougat not found",
+                                 f"Expected nougat at:\n{NOUGAT_EXE}\n\nEdit NOUGAT_EXE in this script.")
+            return
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.run_btn.configure(state=DISABLED)
+        self.log.delete("1.0", END)
+        threading.Thread(target=self._pipeline,
+                         args=(in_pdf, out_dir, name, pages),
+                         daemon=True).start()
+
+    def _pipeline(self, in_pdf: Path, out_dir: Path, name: str, pages: str):
+        try:
+            # Nougat writes <input-stem>.mmd into the output dir, so we work in
+            # a stable temp staging dir and rename afterwards.
+            stage = out_dir / "_nougat_tmp"
+            stage.mkdir(exist_ok=True)
+            for old in stage.glob("*.mmd"):
+                old.unlink()
+
+            cmd = [str(NOUGAT_EXE), str(in_pdf),
+                   "-o", str(stage),
+                   "-m", DEFAULT_MODEL,
+                   "--no-skipping", "--batchsize", "1"]
+            if pages:
+                cmd += ["-p", pages]
+
+            self._log(f"$ {' '.join(cmd)}\n\n")
+            self._stream(cmd)
+
+            produced = list(stage.glob("*.mmd"))
+            if not produced:
+                self._log("\n[ERROR] Nougat produced no .mmd file.\n")
+                return
+            mmd_src = produced[0]
+            mmd_dst = out_dir / f"{name}.mmd"
+            if mmd_dst.exists():
+                mmd_dst.unlink()
+            mmd_src.rename(mmd_dst)
+            self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
+
+            # Optional HTML
+            if self.make_html.get():
+                if not PANDOC_EXE.is_file():
+                    self._log("\n[WARN] pandoc not found, skipping HTML.\n")
+                else:
+                    html = out_dir / f"{name}.html"
+                    self._log(f"\nRunning pandoc -> {html.name}\n")
+                    self._stream([str(PANDOC_EXE), str(mmd_dst), "-s",
+                                  "-o", str(html), "--mathjax"])
+                    self._log(f"[OK] HTML -> {html}\n")
+
+            # Optional PDF
+            if self.make_pdf.get():
+                if not PANDOC_EXE.is_file():
+                    self._log("\n[WARN] pandoc not found, skipping PDF.\n")
+                else:
+                    pdf = out_dir / f"{name}.pdf"
+                    self._log(f"\nRunning pandoc -> {pdf.name} (needs LaTeX)\n")
+                    rc = self._stream([str(PANDOC_EXE), str(mmd_dst),
+                                       "-o", str(pdf), "--pdf-engine=xelatex"])
+                    if rc == 0:
+                        self._log(f"[OK] PDF -> {pdf}\n")
+                    else:
+                        self._log("[ERROR] PDF failed. Install MiKTeX:\n"
+                                  "         winget install --id MiKTeX.MiKTeX -e\n")
+
+            try:
+                stage.rmdir()
+            except OSError:
+                pass
+            self._log("\nDone.\n")
+        except Exception as e:
+            self._log(f"\n[EXCEPTION] {e}\n")
+        finally:
+            self.run_btn.configure(state=NORMAL)
+
+    def _stream(self, cmd) -> int:
+        """Run a subprocess and stream its output to the log. Returns exit code."""
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, creationflags=creationflags,
+        )
+        assert proc.stdout is not None
+        # Nougat emits tqdm bars with carriage returns; collapse them.
+        for raw in iter(proc.stdout.readline, ""):
+            line = re.sub(r".*\r", "", raw)  # keep only the part after the last CR
+            self._log(line)
+        proc.wait()
+        return proc.returncode
+
+
+def main():
+    if not NOUGAT_PYTHON.is_file():
+        print(f"ERROR: nougat venv python not found: {NOUGAT_PYTHON}", file=sys.stderr)
+        sys.exit(1)
+    root = Tk()
+    NougatApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
