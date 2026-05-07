@@ -4,6 +4,7 @@ Nougat GUI - simple desktop app for OCR'ing scientific PDFs to Mathpix Markdown
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -12,10 +13,47 @@ from tkinter import Tk, StringVar, BooleanVar, filedialog, messagebox, END, DISA
 from tkinter import ttk, scrolledtext
 
 # --- Configuration ----------------------------------------------------------
-NOUGAT_PYTHON = Path(r"C:\nougat-env\Scripts\python.exe")
-NOUGAT_EXE    = Path(r"C:\nougat-env\Scripts\nougat.exe")
-PANDOC_EXE    = Path(r"C:\Program Files\Pandoc\pandoc.exe")
 DEFAULT_MODEL = "0.1.0-base"
+
+
+def _find_venv() -> Path:
+    """Locate the Python venv that has nougat installed.
+
+    Resolution order:
+      1. NOUGAT_VENV environment variable (set by installer/launcher).
+      2. ../venv next to this script (release/installer layout).
+      3. C:\\nougat-env (legacy / dev layout).
+    """
+    here = Path(__file__).resolve().parent
+    candidates = []
+    env = os.environ.get("NOUGAT_VENV")
+    if env:
+        candidates.append(Path(env))
+    candidates += [here.parent / "venv", Path(r"C:\nougat-env")]
+    for c in candidates:
+        if (c / "Scripts" / "python.exe").is_file():
+            return c
+    return candidates[0]  # fall through; later checks will report it
+
+
+def _find_pandoc() -> Path:
+    """Pandoc lives wherever winget/installer put it; check PATH first."""
+    on_path = shutil.which("pandoc")
+    if on_path:
+        return Path(on_path)
+    for c in (
+        Path(r"C:\Program Files\Pandoc\pandoc.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / r"Programs\Pandoc\pandoc.exe",
+    ):
+        if c.is_file():
+            return c
+    return Path("pandoc.exe")  # let it fail later with a clear message
+
+
+VENV          = _find_venv()
+NOUGAT_PYTHON = VENV / "Scripts" / "python.exe"
+NOUGAT_EXE    = VENV / "Scripts" / "nougat.exe"
+PANDOC_EXE    = _find_pandoc()
 
 
 def gpu_status() -> str:
