@@ -144,12 +144,19 @@ Write-Ok "Dependencies pinned for Nougat 0.1.17 compatibility"
 # ---------------------------------------------------------------------------
 if (-not $SkipPandoc) {
     Write-Step "Ensuring Pandoc is installed"
-    if (Get-Command pandoc -ErrorAction SilentlyContinue) {
-        Write-Ok "Pandoc already on PATH"
+    function Test-Pandoc {
+        if (Get-Command pandoc -ErrorAction SilentlyContinue) { return $true }
+        return (Test-Path "$env:ProgramFiles\Pandoc\pandoc.exe") -or
+               (Test-Path "$env:LOCALAPPDATA\Programs\Pandoc\pandoc.exe")
+    }
+    if (Test-Pandoc) {
+        Write-Ok "Pandoc already installed"
     } else {
-        winget install --id JohnMacFarlane.Pandoc -e --accept-source-agreements --accept-package-agreements --silent
-        if ($LASTEXITCODE -eq 0) { Write-Ok "Pandoc installed" }
-        else { Write-Warn2 "Pandoc install failed - HTML/PDF export will be unavailable" }
+        winget install --id JohnMacFarlane.Pandoc -e --accept-source-agreements --accept-package-agreements --silent | Out-Null
+        # winget exits non-zero in many "already installed/up-to-date" cases,
+        # so re-check by file presence rather than trusting $LASTEXITCODE.
+        if (Test-Pandoc) { Write-Ok "Pandoc installed" }
+        else { Write-Warn2 "Pandoc not found after install attempt - HTML/PDF export will be unavailable" }
     }
 }
 
