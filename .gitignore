@@ -15,6 +15,9 @@ _nougat_tmp/
 output/
 out/
 
+# Release artifacts
+NougatPDFConverter-v*.zip
+
 # Editor / OS
 .vscode/
 .idea/
