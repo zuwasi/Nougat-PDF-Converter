@@ -220,8 +220,17 @@ class NougatApp:
                 else:
                     html = out_dir / f"{name}.html"
                     self._log(f"\nRunning pandoc -> {html.name}\n")
-                    self._stream([str(PANDOC_EXE), str(mmd_dst), "-s",
-                                  "-o", str(html), "--mathjax"])
+                    # Nougat emits LaTeX-style \(...\) and \[...\] math, not
+                    # pandoc's default $...$. Enable the right extension and
+                    # also widen the page (default max-width 36em chops long
+                    # equations) and give it a title.
+                    self._stream([
+                        str(PANDOC_EXE), str(mmd_dst),
+                        "-f", "markdown+tex_math_double_backslash",
+                        "-s", "-o", str(html), "--mathjax",
+                        "--metadata", f"title={name}",
+                        "-V", "maxwidth=64em",
+                    ])
                     self._log(f"[OK] HTML -> {html}\n")
 
             # Optional PDF
@@ -231,8 +240,11 @@ class NougatApp:
                 else:
                     pdf = out_dir / f"{name}.pdf"
                     self._log(f"\nRunning pandoc -> {pdf.name} (needs LaTeX)\n")
-                    rc = self._stream([str(PANDOC_EXE), str(mmd_dst),
-                                       "-o", str(pdf), "--pdf-engine=xelatex"])
+                    rc = self._stream([
+                        str(PANDOC_EXE), str(mmd_dst),
+                        "-f", "markdown+tex_math_double_backslash",
+                        "-o", str(pdf), "--pdf-engine=xelatex",
+                    ])
                     if rc == 0:
                         self._log(f"[OK] PDF -> {pdf}\n")
                     else:
