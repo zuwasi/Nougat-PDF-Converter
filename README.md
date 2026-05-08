@@ -109,12 +109,21 @@ After install, launch **Nougat PDF Converter** from the Start Menu.
    to whatever base name you want — the app appends `.mmd`, `.html`, `.pdf`.
 4. **Pages** (optional): leave blank to convert the whole document, or use
    ranges/lists like `1-5`, `10`, `1-3,7,12-15`.
-5. Tick **HTML** to also produce a browser-renderable file with MathJax.
+5. **Figure pages** (optional): Nougat is a text/equation model and does
+   not extract figures or diagrams. Type page numbers here (`14-29`,
+   `8,12,17`, etc.) and the app will rasterize those pages at 200 DPI as
+   PNGs into `<name>_figures/` and embed them in the output under a
+   "Figures" section.
+6. Tick **HTML** to also produce a browser-renderable file with MathJax.
    Tick **PDF** if you have MiKTeX installed and want a typeset PDF.
-6. Watch the **Compute** label — it shows `CUDA <gpu name>` if the GPU is
+7. Watch the **Compute** label — it shows `CUDA <gpu name>` if the GPU is
    active, or `CPU` if it's falling back.
-7. Click **Convert**. The log box streams Nougat's progress live
+8. Click **Convert**. The log box streams Nougat's progress live
    (~10 s/page on a recent NVIDIA GPU, 60–90 s/page on CPU).
+
+> **Sample output** is in [`QA-results/`](QA-results/) — a 1983 scanned
+> MIT plasma fusion preprint converted to `.mmd`, `.html`, and the actual
+> figures from pages 14–29 rendered as PNGs.
 
 ---
 
