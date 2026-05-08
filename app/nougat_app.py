@@ -78,13 +78,14 @@ class NougatApp:
         root.title("Nougat PDF -> Markdown / HTML / PDF")
         root.geometry("780x560")
 
-        self.input_pdf  = StringVar()
-        self.output_dir = StringVar(value=str(Path.home() / "Documents"))
-        self.out_name   = StringVar(value="output")
-        self.pages      = StringVar(value="")          # blank = all
-        self.make_html  = BooleanVar(value=True)
-        self.make_pdf   = BooleanVar(value=False)
-        self.gpu_text   = StringVar(value="checking GPU...")
+        self.input_pdf   = StringVar()
+        self.output_dir  = StringVar(value=str(Path.home() / "Documents"))
+        self.out_name    = StringVar(value="output")
+        self.pages       = StringVar(value="")          # blank = all
+        self.figure_pages = StringVar(value="")         # render as PNG
+        self.make_html   = BooleanVar(value=True)
+        self.make_pdf    = BooleanVar(value=False)
+        self.gpu_text    = StringVar(value="checking GPU...")
 
         self._build_ui()
         threading.Thread(target=self._update_gpu, daemon=True).start()
@@ -114,26 +115,31 @@ class NougatApp:
         ttk.Entry(frm, textvariable=self.pages, width=20).grid(row=3, column=1, sticky="w", **pad)
         ttk.Label(frm, text="(blank = all)").grid(row=3, column=1, sticky="w", padx=(180, 0))
 
+        # Row: figure pages (rendered as PNG and embedded)
+        ttk.Label(frm, text="Figure pages (render as image):").grid(row=4, column=0, sticky="e", **pad)
+        ttk.Entry(frm, textvariable=self.figure_pages, width=20).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="(e.g. 14-29; blank = none)").grid(row=4, column=1, sticky="w", padx=(180, 0))
+
         # Row: format checkboxes
         opts = ttk.Frame(frm)
-        opts.grid(row=4, column=1, sticky="w", **pad)
+        opts.grid(row=5, column=1, sticky="w", **pad)
         ttk.Checkbutton(opts, text="Also produce HTML (MathJax)", variable=self.make_html).pack(side="left", padx=4)
         ttk.Checkbutton(opts, text="Also produce PDF (needs LaTeX)", variable=self.make_pdf).pack(side="left", padx=4)
 
         # Row: GPU status
         gpu_frame = ttk.Frame(frm)
-        gpu_frame.grid(row=5, column=1, sticky="w", **pad)
+        gpu_frame.grid(row=6, column=1, sticky="w", **pad)
         ttk.Label(gpu_frame, text="Compute:").pack(side="left")
         ttk.Label(gpu_frame, textvariable=self.gpu_text, foreground="#0a6").pack(side="left", padx=4)
 
         # Row: run button
         self.run_btn = ttk.Button(frm, text="Convert", command=self._run)
-        self.run_btn.grid(row=6, column=1, sticky="w", **pad)
+        self.run_btn.grid(row=7, column=1, sticky="w", **pad)
 
         # Log box
         self.log = scrolledtext.ScrolledText(frm, height=18, wrap="word", font=("Consolas", 9))
-        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew", **pad)
-        frm.rowconfigure(7, weight=1)
+        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad)
+        frm.rowconfigure(8, weight=1)
         frm.columnconfigure(1, weight=1)
 
     # ---------- Helpers ----------
@@ -162,11 +168,81 @@ class NougatApp:
         self.log.update_idletasks()
 
     # ---------- Run pipeline ----------
+    @staticmethod
+    def _parse_pages(spec: str) -> list[int]:
+        """Parse '1-5,10,15-17' -> [1,2,3,4,5,10,15,16,17]."""
+        out: list[int] = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out.extend(range(int(a), int(b) + 1))
+            else:
+                out.append(int(part))
+        return sorted(set(out))
+
+    def _render_figure_pages(self, in_pdf: Path, out_dir: Path,
+                             name: str, page_spec: str) -> list[Path]:
+        """Render selected pages of in_pdf as PNGs into <out_dir>/<name>_figures/.
+        Returns the produced PNG paths in page order."""
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            self._log("\n[WARN] pypdfium2 not available; cannot render figure pages.\n")
+            return []
+
+        try:
+            pages = self._parse_pages(page_spec)
+        except ValueError as e:
+            self._log(f"\n[WARN] Could not parse figure pages '{page_spec}': {e}\n")
+            return []
+        if not pages:
+            return []
+
+        fig_dir = out_dir / f"{name}_figures"
+        fig_dir.mkdir(exist_ok=True)
+        produced: list[Path] = []
+
+        self._log(f"\nRendering figure pages {pages} -> {fig_dir.name}/\n")
+        pdf = pdfium.PdfDocument(str(in_pdf))
+        try:
+            n = len(pdf)
+            for p in pages:
+                if p < 1 or p > n:
+                    self._log(f"  page {p}: out of range (PDF has {n})\n")
+                    continue
+                page = pdf[p - 1]
+                # 200 DPI -> scale = 200/72 ~ 2.78
+                bitmap = page.render(scale=200 / 72)
+                pil = bitmap.to_pil()
+                out_png = fig_dir / f"page-{p:03d}.png"
+                pil.save(out_png, format="PNG", optimize=True)
+                produced.append(out_png)
+                self._log(f"  page {p}: -> {out_png.name}\n")
+        finally:
+            pdf.close()
+        return produced
+
+    @staticmethod
+    def _append_figures_to_mmd(mmd_path: Path, name: str, pngs: list[Path]) -> None:
+        if not pngs:
+            return
+        lines = ["\n\n## Figures (rendered from source PDF)\n"]
+        for png in pngs:
+            page_num = int(png.stem.split("-")[-1])
+            rel = f"{name}_figures/{png.name}"
+            lines.append(f"\n**Page {page_num}**\n\n![Page {page_num}]({rel})\n")
+        with mmd_path.open("a", encoding="utf-8") as f:
+            f.writelines(lines)
+
     def _run(self):
         in_pdf = Path(self.input_pdf.get().strip().strip('"'))
         out_dir = Path(self.output_dir.get().strip().strip('"'))
         name = (self.out_name.get().strip() or in_pdf.stem)
         pages = self.pages.get().strip()
+        fig_pages = self.figure_pages.get().strip()
 
         if not in_pdf.is_file():
             messagebox.showerror("Missing file", f"Input PDF not found:\n{in_pdf}")
@@ -180,10 +256,11 @@ class NougatApp:
         self.run_btn.configure(state=DISABLED)
         self.log.delete("1.0", END)
         threading.Thread(target=self._pipeline,
-                         args=(in_pdf, out_dir, name, pages),
+                         args=(in_pdf, out_dir, name, pages, fig_pages),
                          daemon=True).start()
 
-    def _pipeline(self, in_pdf: Path, out_dir: Path, name: str, pages: str):
+    def _pipeline(self, in_pdf: Path, out_dir: Path, name: str,
+                  pages: str, fig_pages: str):
         try:
             # Nougat writes <input-stem>.mmd into the output dir, so we work in
             # a stable temp staging dir and rename afterwards.
@@ -212,6 +289,13 @@ class NougatApp:
                 mmd_dst.unlink()
             mmd_src.rename(mmd_dst)
             self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
+
+            # Optional: render figure pages and append them to the markdown
+            if fig_pages:
+                pngs = self._render_figure_pages(in_pdf, out_dir, name, fig_pages)
+                if pngs:
+                    self._append_figures_to_mmd(mmd_dst, name, pngs)
+                    self._log(f"[OK] Appended {len(pngs)} figure page(s) to .mmd\n")
 
             # Optional HTML
             if self.make_html.get():
