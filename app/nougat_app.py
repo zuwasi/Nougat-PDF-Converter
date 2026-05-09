@@ -226,16 +226,48 @@ class NougatApp:
         return produced
 
     @staticmethod
-    def _append_figures_to_mmd(mmd_path: Path, name: str, pngs: list[Path]) -> None:
+    def _embed_figures_in_mmd(mmd_path: Path, name: str, pngs: list[Path]) -> int:
+        """Insert each rendered page-image inline, right under the matching
+        `Figure N.` caption Nougat extracted. Pairs caption-N with the i-th
+        rendered page (assumes user gave figure pages in figure-number order,
+        which is true for nearly all scientific papers).
+
+        Any rendered pages with no matching caption are appended at the end
+        under '## Additional figure pages'. Returns total embedded count.
+        """
         if not pngs:
-            return
-        lines = ["\n\n## Figures (rendered from source PDF)\n"]
-        for png in pngs:
-            page_num = int(png.stem.split("-")[-1])
-            rel = f"{name}_figures/{png.name}"
-            lines.append(f"\n**Page {page_num}**\n\n![Page {page_num}]({rel})\n")
-        with mmd_path.open("a", encoding="utf-8") as f:
-            f.writelines(lines)
+            return 0
+        text = mmd_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+
+        cap_re = re.compile(r"^\s*Figure\s+(\d+[a-z]?)\.\s")
+        seen: set[str] = set()
+        cap_positions: list[tuple[int, str]] = []
+        for i, line in enumerate(lines):
+            m = cap_re.match(line)
+            if m and m.group(1) not in seen:
+                seen.add(m.group(1))
+                cap_positions.append((i, m.group(1)))
+
+        paired = list(zip(cap_positions, pngs))
+        leftover = pngs[len(paired):]
+
+        # Insert bottom-up so the indices we recorded stay valid.
+        for (idx, label), png in reversed(paired):
+            rel = f"{name}_figures/{png.name}".replace("\\", "/")
+            lines.insert(idx + 1, f"\n![Figure {label}]({rel})\n")
+
+        if leftover:
+            lines.append("")
+            lines.append("## Additional figure pages")
+            for png in leftover:
+                page_num = int(png.stem.split("-")[-1])
+                rel = f"{name}_figures/{png.name}".replace("\\", "/")
+                lines.append(f"\n**Page {page_num}**\n")
+                lines.append(f"![Page {page_num}]({rel})\n")
+
+        mmd_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return len(pngs)
 
     def _run(self):
         in_pdf = Path(self.input_pdf.get().strip().strip('"'))
@@ -290,12 +322,13 @@ class NougatApp:
             mmd_src.rename(mmd_dst)
             self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
 
-            # Optional: render figure pages and append them to the markdown
+            # Optional: render figure pages and embed them inline beside the
+            # matching captions Nougat extracted.
             if fig_pages:
                 pngs = self._render_figure_pages(in_pdf, out_dir, name, fig_pages)
                 if pngs:
-                    self._append_figures_to_mmd(mmd_dst, name, pngs)
-                    self._log(f"[OK] Appended {len(pngs)} figure page(s) to .mmd\n")
+                    n = self._embed_figures_in_mmd(mmd_dst, name, pngs)
+                    self._log(f"[OK] Embedded {n} figure(s) inline in .mmd\n")
 
             # Optional HTML
             if self.make_html.get():
