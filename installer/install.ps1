@@ -139,6 +139,12 @@ $pins = @(
 if ($LASTEXITCODE -ne 0) { throw "pinning failed" }
 Write-Ok "Dependencies pinned for Nougat 0.1.17 compatibility"
 
+# LlamaParse client (cloud engine, free tier)
+Write-Step "Installing LlamaParse SDK (cloud engine)"
+& $venvPy -m pip install --quiet llama-cloud-services 'llama-cloud==0.1.46'
+if ($LASTEXITCODE -eq 0) { Write-Ok "LlamaParse SDK installed" }
+else { Write-Warn2 "LlamaParse SDK install failed (cloud engine will be unavailable)" }
+
 # ---------------------------------------------------------------------------
 # 5. Pandoc (optional)
 # ---------------------------------------------------------------------------

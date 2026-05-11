@@ -1,7 +1,13 @@
 """
 Nougat GUI - simple desktop app for OCR'ing scientific PDFs to Mathpix Markdown
-(and optionally HTML/PDF via pandoc). Runs Nougat on GPU when available.
+(and optionally HTML/PDF via pandoc).
+
+Two parsing engines:
+  * Nougat   - local, free, GPU-accelerated, weak on dense layouts
+  * LlamaParse premium - cloud, free tier (1000 credits/day), much better
+                         on math/2-column papers
 """
+import json
 import os
 import re
 import shutil
@@ -12,6 +18,26 @@ import time
 from pathlib import Path
 from tkinter import Tk, StringVar, BooleanVar, filedialog, messagebox, END, DISABLED, NORMAL
 from tkinter import ttk, scrolledtext
+
+ENGINE_NOUGAT     = "Nougat (local, free, GPU)"
+ENGINE_LLAMAPARSE = "LlamaParse Premium (cloud, free tier)"
+SETTINGS_PATH = Path(os.environ.get("LOCALAPPDATA",
+                                    str(Path.home()))) / "NougatPDFConverter" / "settings.json"
+
+
+def _load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_settings(data: dict) -> None:
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # --- Configuration ----------------------------------------------------------
 DEFAULT_MODEL = "0.1.0-base"
@@ -76,6 +102,71 @@ def _default_output_dir() -> str:
     return str(Path.home())
 
 
+def auto_clean_mmd(text: str) -> tuple[str, dict]:
+    """Strip common Nougat OCR artefacts so the math at least renders.
+    Returns (cleaned_text, stats)."""
+    stats = {"text_loops": 0, "ws_runs": 0, "bar_loops": 0, "stray_rbrack": 0}
+
+    # 1. Runaway \text{\text{\text{...}}} loops -> single \text{}
+    def _fix_text_loop(m: re.Match) -> str:
+        stats["text_loops"] += 1
+        return r"\text{}"
+    text = re.sub(r"(?:\\text\{\s*){4,}\}*", _fix_text_loop, text)
+
+    # 2. Long whitespace runs in math: \,\,\,\,\,...  ->  \quad
+    def _fix_ws(m: re.Match) -> str:
+        stats["ws_runs"] += 1
+        return r"\quad "
+    text = re.sub(r"(?:\\,\s*){8,}", _fix_ws, text)
+
+    # 3. Bar-vector token loops like
+    #    \bar{\mathbf{x}} \bar{\mathbf{y}} \bar{\mathbf{x}} \bar{\mathbf{y}} ...
+    def _fix_bar_loop(m: re.Match) -> str:
+        stats["bar_loops"] += 1
+        return r"\bar{\mathbf{x}}\bar{\mathbf{x}} + \bar{\mathbf{y}}\bar{\mathbf{y}} + \bar{\mathbf{z}}\bar{\mathbf{z}}"
+    text = re.sub(
+        r"(?:\\bar\{\\mathbf\{[xyz]\}\}\s*){6,}",
+        _fix_bar_loop, text,
+    )
+
+    # 4. Stray \rbrack with no opening \lbrack on the same equation line
+    def _fix_rbrack(m: re.Match) -> str:
+        stats["stray_rbrack"] += 1
+        return "]"
+    text = re.sub(r"\\rbrack(?![\w])", _fix_rbrack, text)
+
+    return text, stats
+
+
+def run_llamaparse(pdf: Path, out_md: Path, api_key: str, log) -> None:
+    """Send pdf to LlamaParse premium-mode and save the resulting markdown."""
+    log("Submitting to LlamaParse (premium mode)...\n")
+    os.environ["LLAMA_CLOUD_API_KEY"] = api_key
+    try:
+        from llama_cloud_services import LlamaParse
+    except ImportError:
+        raise RuntimeError(
+            "llama-cloud-services not installed. Run:\n"
+            f"  {NOUGAT_PYTHON} -m pip install llama-cloud-services llama-cloud==0.1.46"
+        )
+    parser = LlamaParse(
+        result_type="markdown",
+        parse_mode="parse_page_with_lvm",
+        language="en",
+        verbose=False,
+    )
+    result = parser.parse(str(pdf))
+    try:
+        result.save_markdown(str(out_md))
+    except AttributeError:
+        # Fallback for very new SDK shapes that drop .save_markdown
+        md = ""
+        for page in getattr(result, "pages", []):
+            md += getattr(page, "md", "") + "\n\n"
+        out_md.write_text(md, encoding="utf-8")
+    log(f"  LlamaParse done -> {out_md.name}\n")
+
+
 def gpu_status() -> str:
     """Return a short string describing CUDA / GPU availability."""
     try:
@@ -96,16 +187,20 @@ class NougatApp:
     def __init__(self, root: Tk):
         self.root = root
         root.title("Nougat PDF -> Markdown / HTML / PDF")
-        root.geometry("780x560")
+        root.geometry("820x680")
 
-        self.input_pdf   = StringVar()
-        self.output_dir  = StringVar(value=_default_output_dir())
-        self.out_name    = StringVar(value="output")
-        self.pages       = StringVar(value="")          # blank = all
-        self.figure_pages = StringVar(value="")         # render as PNG
-        self.make_html   = BooleanVar(value=True)
-        self.make_pdf    = BooleanVar(value=False)
-        self.gpu_text    = StringVar(value="checking GPU...")
+        s = _load_settings()
+        self.input_pdf    = StringVar()
+        self.output_dir   = StringVar(value=s.get("output_dir", _default_output_dir()))
+        self.out_name     = StringVar(value="output")
+        self.pages        = StringVar(value="")          # blank = all
+        self.figure_pages = StringVar(value="")          # render as PNG
+        self.engine       = StringVar(value=s.get("engine", ENGINE_NOUGAT))
+        self.api_key      = StringVar(value=s.get("llamaparse_api_key", ""))
+        self.auto_clean   = BooleanVar(value=s.get("auto_clean", True))
+        self.make_html    = BooleanVar(value=True)
+        self.make_pdf     = BooleanVar(value=False)
+        self.gpu_text     = StringVar(value="checking GPU...")
 
         self._build_ui()
         threading.Thread(target=self._update_gpu, daemon=True).start()
@@ -140,27 +235,65 @@ class NougatApp:
         ttk.Entry(frm, textvariable=self.figure_pages, width=20).grid(row=4, column=1, sticky="w", **pad)
         ttk.Label(frm, text="(e.g. 14-29; blank = none)").grid(row=4, column=1, sticky="w", padx=(180, 0))
 
-        # Row: format checkboxes
+        # Row: engine selector
+        ttk.Label(frm, text="Engine:").grid(row=5, column=0, sticky="e", **pad)
+        engine_cb = ttk.Combobox(frm, textvariable=self.engine,
+                                 values=[ENGINE_NOUGAT, ENGINE_LLAMAPARSE],
+                                 state="readonly", width=44)
+        engine_cb.grid(row=5, column=1, sticky="w", **pad)
+        engine_cb.bind("<<ComboboxSelected>>", lambda e: self._on_engine_change())
+
+        # Row: LlamaParse API key (visible only when LlamaParse selected)
+        self.api_lbl = ttk.Label(frm, text="LlamaParse API key:")
+        self.api_lbl.grid(row=6, column=0, sticky="e", **pad)
+        self.api_entry = ttk.Entry(frm, textvariable=self.api_key, width=58, show="*")
+        self.api_entry.grid(row=6, column=1, sticky="w", **pad)
+        ttk.Button(frm, text="Save", command=self._save_settings_now).grid(row=6, column=2, **pad)
+
+        # Row: format / cleanup checkboxes
         opts = ttk.Frame(frm)
-        opts.grid(row=5, column=1, sticky="w", **pad)
-        ttk.Checkbutton(opts, text="Also produce HTML (MathJax)", variable=self.make_html).pack(side="left", padx=4)
-        ttk.Checkbutton(opts, text="Also produce PDF (needs LaTeX)", variable=self.make_pdf).pack(side="left", padx=4)
+        opts.grid(row=7, column=1, sticky="w", **pad)
+        ttk.Checkbutton(opts, text="Auto-clean OCR artefacts",
+                        variable=self.auto_clean).pack(side="left", padx=4)
+        ttk.Checkbutton(opts, text="Also produce HTML (MathJax)",
+                        variable=self.make_html).pack(side="left", padx=4)
+        ttk.Checkbutton(opts, text="Also produce PDF (needs LaTeX)",
+                        variable=self.make_pdf).pack(side="left", padx=4)
 
         # Row: GPU status
         gpu_frame = ttk.Frame(frm)
-        gpu_frame.grid(row=6, column=1, sticky="w", **pad)
+        gpu_frame.grid(row=8, column=1, sticky="w", **pad)
         ttk.Label(gpu_frame, text="Compute:").pack(side="left")
         ttk.Label(gpu_frame, textvariable=self.gpu_text, foreground="#0a6").pack(side="left", padx=4)
 
         # Row: run button
         self.run_btn = ttk.Button(frm, text="Convert", command=self._run)
-        self.run_btn.grid(row=7, column=1, sticky="w", **pad)
+        self.run_btn.grid(row=9, column=1, sticky="w", **pad)
 
         # Log box
         self.log = scrolledtext.ScrolledText(frm, height=18, wrap="word", font=("Consolas", 9))
-        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad)
-        frm.rowconfigure(8, weight=1)
+        self.log.grid(row=10, column=0, columnspan=3, sticky="nsew", **pad)
+        frm.rowconfigure(10, weight=1)
         frm.columnconfigure(1, weight=1)
+
+        self._on_engine_change()  # initial show/hide of the API key row
+
+    def _on_engine_change(self):
+        if self.engine.get() == ENGINE_LLAMAPARSE:
+            self.api_lbl.grid()
+            self.api_entry.grid()
+        else:
+            self.api_lbl.grid_remove()
+            self.api_entry.grid_remove()
+
+    def _save_settings_now(self):
+        _save_settings({
+            "output_dir": self.output_dir.get(),
+            "engine": self.engine.get(),
+            "llamaparse_api_key": self.api_key.get(),
+            "auto_clean": bool(self.auto_clean.get()),
+        })
+        messagebox.showinfo("Saved", f"Settings saved to:\n{SETTINGS_PATH}")
 
     # ---------- Helpers ----------
     def _pick_input(self):
@@ -330,50 +463,80 @@ class NougatApp:
         name = (self.out_name.get().strip() or in_pdf.stem)
         pages = self.pages.get().strip()
         fig_pages = self.figure_pages.get().strip()
+        engine = self.engine.get()
 
         if not in_pdf.is_file():
             messagebox.showerror("Missing file", f"Input PDF not found:\n{in_pdf}")
             return
-        if not NOUGAT_EXE.is_file():
+        if engine == ENGINE_NOUGAT and not NOUGAT_EXE.is_file():
             messagebox.showerror("Nougat not found",
-                                 f"Expected nougat at:\n{NOUGAT_EXE}\n\nEdit NOUGAT_EXE in this script.")
+                                 f"Expected nougat at:\n{NOUGAT_EXE}\n\nRe-run the installer.")
+            return
+        if engine == ENGINE_LLAMAPARSE and not self.api_key.get().strip():
+            messagebox.showerror("API key required",
+                                 "LlamaParse needs an API key. Get one free at\n"
+                                 "https://cloud.llamaindex.ai\nthen paste it and click Save.")
             return
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist current settings on every run.
+        _save_settings({
+            "output_dir": self.output_dir.get(),
+            "engine": engine,
+            "llamaparse_api_key": self.api_key.get(),
+            "auto_clean": bool(self.auto_clean.get()),
+        })
 
         self.run_btn.configure(state=DISABLED)
         self.log.delete("1.0", END)
         threading.Thread(target=self._pipeline,
-                         args=(in_pdf, out_dir, name, pages, fig_pages),
+                         args=(in_pdf, out_dir, name, pages, fig_pages, engine),
                          daemon=True).start()
 
     def _pipeline(self, in_pdf: Path, out_dir: Path, name: str,
-                  pages: str, fig_pages: str):
+                  pages: str, fig_pages: str, engine: str):
         try:
-            # Nougat writes <input-stem>.mmd into the output dir, so we work in
-            # a stable temp staging dir and rename afterwards.
-            stage = out_dir / "_nougat_tmp"
-            stage.mkdir(exist_ok=True)
-            for old in stage.glob("*.mmd"):
-                old.unlink()
-
-            cmd = [str(NOUGAT_EXE), str(in_pdf),
-                   "-o", str(stage),
-                   "-m", DEFAULT_MODEL,
-                   "--no-skipping", "--batchsize", "1"]
-            if pages:
-                cmd += ["-p", pages]
-
-            self._log(f"$ {' '.join(cmd)}\n\n")
-            self._stream(cmd)
-
-            produced = list(stage.glob("*.mmd"))
-            if not produced:
-                self._log("\n[ERROR] Nougat produced no .mmd file.\n")
-                return
-            mmd_src = produced[0]
             mmd_dst = out_dir / f"{name}.mmd"
-            self._safe_replace(mmd_src, mmd_dst)
-            self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
+
+            if engine == ENGINE_LLAMAPARSE:
+                self._log(f"Engine: LlamaParse premium\n")
+                run_llamaparse(in_pdf, mmd_dst, self.api_key.get().strip(), self._log)
+                self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
+            else:
+                # Nougat: it writes <input-stem>.mmd into the output dir, so
+                # work in a stable staging dir and move afterwards.
+                stage = out_dir / "_nougat_tmp"
+                stage.mkdir(exist_ok=True)
+                for old in stage.glob("*.mmd"):
+                    old.unlink()
+
+                cmd = [str(NOUGAT_EXE), str(in_pdf),
+                       "-o", str(stage),
+                       "-m", DEFAULT_MODEL,
+                       "--no-skipping", "--batchsize", "1"]
+                if pages:
+                    cmd += ["-p", pages]
+
+                self._log(f"Engine: Nougat\n$ {' '.join(cmd)}\n\n")
+                self._stream(cmd)
+
+                produced = list(stage.glob("*.mmd"))
+                if not produced:
+                    self._log("\n[ERROR] Nougat produced no .mmd file.\n")
+                    return
+                self._safe_replace(produced[0], mmd_dst)
+                self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
+                shutil.rmtree(stage, ignore_errors=True)
+
+            # Auto-clean OCR artefacts (token loops, whitespace runs, etc.)
+            if self.auto_clean.get():
+                txt = mmd_dst.read_text(encoding="utf-8")
+                cleaned, stats = auto_clean_mmd(txt)
+                if cleaned != txt:
+                    mmd_dst.write_text(cleaned, encoding="utf-8")
+                    self._log(f"[OK] Auto-cleaned: {stats}\n")
+                else:
+                    self._log("[OK] Auto-clean: no artefacts found\n")
 
             # Optional: render figure pages and embed them inline beside the
             # matching captions Nougat extracted.
@@ -421,7 +584,6 @@ class NougatApp:
                         self._log("[ERROR] PDF failed. Install MiKTeX:\n"
                                   "         winget install --id MiKTeX.MiKTeX -e\n")
 
-            shutil.rmtree(stage, ignore_errors=True)
             self._log("\nDone.\n")
         except Exception as e:
             self._log(f"\n[EXCEPTION] {e}\n")
