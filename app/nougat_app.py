@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from tkinter import Tk, StringVar, BooleanVar, filedialog, messagebox, END, DISABLED, NORMAL
 from tkinter import ttk, scrolledtext
@@ -225,6 +226,39 @@ class NougatApp:
             pdf.close()
         return produced
 
+    def _safe_replace(self, src: Path, dst: Path,
+                      retries: int = 6, delay: float = 0.5) -> None:
+        """Move src -> dst, replacing dst if it exists. Robust against
+        Windows + OneDrive sync transient locks: retries with backoff and
+        falls back to copy + best-effort delete."""
+        last_err: Exception | None = None
+        for attempt in range(retries):
+            try:
+                # Path.replace overwrites atomically on the same volume.
+                src.replace(dst)
+                return
+            except (PermissionError, OSError) as e:
+                last_err = e
+                self._log(
+                    f"  rename attempt {attempt+1}/{retries} failed: {e.__class__.__name__}; retrying...\n"
+                )
+                time.sleep(delay)
+                delay *= 1.5
+        # Last resort: copy + try to delete the source.
+        self._log("  falling back to copy + delete\n")
+        try:
+            shutil.copy2(str(src), str(dst))
+            try:
+                src.unlink()
+            except Exception as ue:
+                self._log(f"  warning: could not delete staging file ({ue})\n")
+            return
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not write {dst}. The file may be open in another program "
+                f"(browser, editor) or locked by OneDrive sync. Original error: {last_err}"
+            ) from e
+
     @staticmethod
     def _embed_figures_in_mmd(mmd_path: Path, name: str, pngs: list[Path]) -> int:
         """Insert each rendered page-image inline, right under the matching
@@ -319,9 +353,7 @@ class NougatApp:
                 return
             mmd_src = produced[0]
             mmd_dst = out_dir / f"{name}.mmd"
-            if mmd_dst.exists():
-                mmd_dst.unlink()
-            mmd_src.rename(mmd_dst)
+            self._safe_replace(mmd_src, mmd_dst)
             self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
 
             # Optional: render figure pages and embed them inline beside the
@@ -370,10 +402,7 @@ class NougatApp:
                         self._log("[ERROR] PDF failed. Install MiKTeX:\n"
                                   "         winget install --id MiKTeX.MiKTeX -e\n")
 
-            try:
-                stage.rmdir()
-            except OSError:
-                pass
+            shutil.rmtree(stage, ignore_errors=True)
             self._log("\nDone.\n")
         except Exception as e:
             self._log(f"\n[EXCEPTION] {e}\n")
