@@ -240,7 +240,9 @@ class NougatApp:
         text = mmd_path.read_text(encoding="utf-8")
         lines = text.splitlines()
 
-        cap_re = re.compile(r"^\s*Figure\s+(\d+[a-z]?)\.\s")
+        # Match common caption styles: "Figure 1.", "Fig. 1.", "Fig 1:",
+        # "Figure 1a:", etc.
+        cap_re = re.compile(r"^\s*(?:Figure|Fig\.?)\s+(\d+[a-z]?)\s*[.:]\s")
         seen: set[str] = set()
         cap_positions: list[tuple[int, str]] = []
         for i, line in enumerate(lines):
