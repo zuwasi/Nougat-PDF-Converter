@@ -57,6 +57,25 @@ NOUGAT_EXE    = VENV / "Scripts" / "nougat.exe"
 PANDOC_EXE    = _find_pandoc()
 
 
+def _default_output_dir() -> str:
+    """Pick a safe writable folder, avoiding Documents on Windows because it
+    is often protected by Controlled Folder Access / OneDrive Backup with
+    deny-delete ACLs that break atomic file moves."""
+    candidates = [Path(r"C:\Amp_demos\nougat-out"), Path.home() / "Nougat-Output"]
+    for c in candidates:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            # Probe write access by creating + deleting a sentinel file.
+            probe = c / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return str(c)
+        except Exception:
+            continue
+    # Last resort
+    return str(Path.home())
+
+
 def gpu_status() -> str:
     """Return a short string describing CUDA / GPU availability."""
     try:
@@ -80,7 +99,7 @@ class NougatApp:
         root.geometry("780x560")
 
         self.input_pdf   = StringVar()
-        self.output_dir  = StringVar(value=str(Path.home() / "Documents"))
+        self.output_dir  = StringVar(value=_default_output_dir())
         self.out_name    = StringVar(value="output")
         self.pages       = StringVar(value="")          # blank = all
         self.figure_pages = StringVar(value="")         # render as PNG
