@@ -19,8 +19,13 @@ from pathlib import Path
 from tkinter import Tk, StringVar, BooleanVar, filedialog, messagebox, END, DISABLED, NORMAL
 from tkinter import ttk, scrolledtext
 
-ENGINE_NOUGAT     = "Nougat (local, free, GPU)"
-ENGINE_LLAMAPARSE = "LlamaParse Premium (cloud, free tier)"
+ENGINE_NOUGAT          = "Nougat (local, free, GPU)"
+ENGINE_LLAMAPARSE      = "LlamaParse Premium (cloud, ~15 cr/page)"
+ENGINE_LLAMAPARSE_PLUS = "LlamaParse Premium-Plus (cloud, ~45 cr/page)"
+LLAMAPARSE_MODES = {
+    ENGINE_LLAMAPARSE:      "parse_page_with_lvm",
+    ENGINE_LLAMAPARSE_PLUS: "parse_page_with_agent",
+}
 SETTINGS_PATH = Path(os.environ.get("LOCALAPPDATA",
                                     str(Path.home()))) / "NougatPDFConverter" / "settings.json"
 
@@ -103,9 +108,29 @@ def _default_output_dir() -> str:
 
 
 def auto_clean_mmd(text: str) -> tuple[str, dict]:
-    """Strip common Nougat OCR artefacts so the math at least renders.
+    """Strip common Nougat / LlamaParse OCR artefacts so the math renders
+    and the prose isn't polluted with publisher boilerplate.
     Returns (cleaned_text, stats)."""
-    stats = {"text_loops": 0, "ws_runs": 0, "bar_loops": 0, "stray_rbrack": 0}
+    stats = {"text_loops": 0, "ws_runs": 0, "bar_loops": 0,
+             "stray_rbrack": 0, "footers": 0}
+
+    # 0. Strip common publisher / journal footer boilerplate.
+    footer_patterns = [
+        # "Authorized licensed use limited to: X. Downloaded on YYY ... Restrictions apply."
+        r"^Authorized licensed use[^\n]*Restrictions apply\.?\s*$",
+        # IEEE journal ID line e.g. "0018-926X/88/0300-0369$01.00 © 1988 IEEE"
+        r"^\d{4}-\d{3,4}X?/\d{2}/\d{4}-\d{4}\$\d+\.\d{2}\s*©?\s*\d{4}\s*IEEE\.?\s*$",
+        # "© 2023 IEEE" / "© 2023 Elsevier" trailing line
+        r"^©\s*\d{4}\s+(?:IEEE|Elsevier|Springer|ACM|Wiley)[^\n]*$",
+        # bare page number on its own line (very short numeric lines)
+        r"^\s*\d{1,4}\s*$",
+    ]
+    for pat in footer_patterns:
+        new_text, n = re.subn(pat, "", text, flags=re.MULTILINE)
+        stats["footers"] += n
+        text = new_text
+    # Collapse triple+ blank lines created by removals
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
     # 1. Runaway \text{\text{\text{...}}} loops -> single \text{}
     def _fix_text_loop(m: re.Match) -> str:
@@ -138,9 +163,10 @@ def auto_clean_mmd(text: str) -> tuple[str, dict]:
     return text, stats
 
 
-def run_llamaparse(pdf: Path, out_md: Path, api_key: str, log) -> None:
-    """Send pdf to LlamaParse premium-mode and save the resulting markdown."""
-    log("Submitting to LlamaParse (premium mode)...\n")
+def run_llamaparse(pdf: Path, out_md: Path, api_key: str,
+                   parse_mode: str, log) -> None:
+    """Send pdf to LlamaParse and save the resulting markdown."""
+    log(f"Submitting to LlamaParse (mode={parse_mode})...\n")
     os.environ["LLAMA_CLOUD_API_KEY"] = api_key
     try:
         from llama_cloud_services import LlamaParse
@@ -151,7 +177,7 @@ def run_llamaparse(pdf: Path, out_md: Path, api_key: str, log) -> None:
         )
     parser = LlamaParse(
         result_type="markdown",
-        parse_mode="parse_page_with_lvm",
+        parse_mode=parse_mode,
         language="en",
         verbose=False,
     )
@@ -159,7 +185,6 @@ def run_llamaparse(pdf: Path, out_md: Path, api_key: str, log) -> None:
     try:
         result.save_markdown(str(out_md))
     except AttributeError:
-        # Fallback for very new SDK shapes that drop .save_markdown
         md = ""
         for page in getattr(result, "pages", []):
             md += getattr(page, "md", "") + "\n\n"
@@ -238,7 +263,9 @@ class NougatApp:
         # Row: engine selector
         ttk.Label(frm, text="Engine:").grid(row=5, column=0, sticky="e", **pad)
         engine_cb = ttk.Combobox(frm, textvariable=self.engine,
-                                 values=[ENGINE_NOUGAT, ENGINE_LLAMAPARSE],
+                                 values=[ENGINE_NOUGAT,
+                                         ENGINE_LLAMAPARSE,
+                                         ENGINE_LLAMAPARSE_PLUS],
                                  state="readonly", width=44)
         engine_cb.grid(row=5, column=1, sticky="w", **pad)
         engine_cb.bind("<<ComboboxSelected>>", lambda e: self._on_engine_change())
@@ -279,7 +306,7 @@ class NougatApp:
         self._on_engine_change()  # initial show/hide of the API key row
 
     def _on_engine_change(self):
-        if self.engine.get() == ENGINE_LLAMAPARSE:
+        if self.engine.get() in LLAMAPARSE_MODES:
             self.api_lbl.grid()
             self.api_entry.grid()
         else:
@@ -472,7 +499,7 @@ class NougatApp:
             messagebox.showerror("Nougat not found",
                                  f"Expected nougat at:\n{NOUGAT_EXE}\n\nRe-run the installer.")
             return
-        if engine == ENGINE_LLAMAPARSE and not self.api_key.get().strip():
+        if engine in LLAMAPARSE_MODES and not self.api_key.get().strip():
             messagebox.showerror("API key required",
                                  "LlamaParse needs an API key. Get one free at\n"
                                  "https://cloud.llamaindex.ai\nthen paste it and click Save.")
@@ -498,9 +525,11 @@ class NougatApp:
         try:
             mmd_dst = out_dir / f"{name}.mmd"
 
-            if engine == ENGINE_LLAMAPARSE:
-                self._log(f"Engine: LlamaParse premium\n")
-                run_llamaparse(in_pdf, mmd_dst, self.api_key.get().strip(), self._log)
+            if engine in LLAMAPARSE_MODES:
+                parse_mode = LLAMAPARSE_MODES[engine]
+                self._log(f"Engine: {engine} (mode={parse_mode})\n")
+                run_llamaparse(in_pdf, mmd_dst, self.api_key.get().strip(),
+                               parse_mode, self._log)
                 self._log(f"\n[OK] Markdown -> {mmd_dst}\n")
             else:
                 # Nougat: it writes <input-stem>.mmd into the output dir, so
